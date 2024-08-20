@@ -141,34 +141,32 @@ int ol_peer_recovery_notifier_cb(struct notifier_block *block,
 	struct peer_hang_data hang_data = {0};
 	enum peer_debug_id_type dbg_id;
 
-	if (!data || !block)
-		return -EINVAL;
+	static QDF_STATUS ol_txrx_pkt_send(struct cdp_soc_t *soc_hdl, uint8_t vdev_id,
+	   qdf_nbuf_t nbuf)
+	{
+	struct ol_txrx_soc_t *soc = cdp_soc_t_to_ol_txrx_soc_t(soc_hdl);
+	struct ol_txrx_vdev_t *vdev = ol_txrx_get_vdev_from_soc_vdev_id(soc, vdev_id);
 
-	notif_block = qdf_container_of(block, qdf_notif_block, notif_block);
+	if (!vdev)
+	return QDF_STATUS_E_INVAL;
 
-	peer = notif_block->priv_data;
-	if (!peer)
-		return -EINVAL;
+	if (vdev->is_packet_injection_enabled) {
+	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)qdf_nbuf_data(nbuf);
 
-	if (notif_data->offset >= QDF_WLAN_MAX_HOST_OFFSET)
-		return NOTIFY_STOP_MASK;
+	/* Set frame control field for injected packet */
+	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA | IEEE80211_STYPE_DATA);
 
-	QDF_HANG_EVT_SET_HDR(&hang_data.tlv_header,
-			     HANG_EVT_TAG_DP_PEER_INFO,
-			     QDF_HANG_GET_STRUCT_TLVLEN(struct peer_hang_data));
+	/* Set address fields */
+	ether_addr_copy(hdr->addr1, vdev->mac_addr.raw);
+	ether_addr_copy(hdr->addr2, vdev->bssid.raw);
+	ether_addr_copy(hdr->addr3, vdev->bssid.raw);
 
-	qdf_mem_copy(&hang_data.peer_mac_addr, &peer->mac_addr.raw,
-		     QDF_MAC_ADDR_SIZE);
+	/* Send packet using appropriate hardware interface */
+	return ol_tx_send_raw_frame(vdev, nbuf, IEEE80211_TX_CTL_INJECT);
+	}
 
-	for (dbg_id = 0; dbg_id < PEER_DEBUG_ID_MAX; dbg_id++)
-		if (qdf_atomic_read(&peer->access_list[dbg_id]))
-			hang_data.peer_timeout_bitmask |= (1 << dbg_id);
-
-	qdf_mem_copy(notif_data->hang_data + notif_data->offset,
-		     &hang_data, sizeof(struct peer_hang_data));
-	notif_data->offset += sizeof(struct peer_hang_data);
-
-	return 0;
+	/* If packet injection is not enabled, proceed with normal transmission */
+	return vdev->tx(vdev, nbuf);
 }
 
 static qdf_notif_block ol_peer_recovery_notifier = {
@@ -2598,6 +2596,11 @@ ol_txrx_vdev_attach(struct cdp_pdev *ppdev,
 	qdf_status = qdf_event_create(&vdev->wait_delete_comp);
 	/* add this vdev into the pdev's list */
 	TAILQ_INSERT_TAIL(&pdev->vdev_list, vdev, vdev_list_elem);
+
+	/* Initialize packet injection related fields */
+	vdev->is_packet_injection_enabled = false;
+	vdev->inject_tx_rate = 0;
+	vdev->inject_tx_power = 0;
 
 	ol_txrx_dbg(
 		   "Created vdev %pK (%02x:%02x:%02x:%02x:%02x:%02x)\n",
